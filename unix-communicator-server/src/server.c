@@ -15,13 +15,27 @@ int main(int argc, const char * argv[])
 {
     init_server();
     void* received = malloc(2048);
+    time_t send_hb_time = time(0);
+    time_t check_hb_time = time(0);
     while(1){
+        
+        
         receive_msg(received, _size(MSG_LOGIN), LOGIN, &handle_login);
         receive_msg(received, _size(MSG_LOGIN), LOGOUT, &handle_logout);
-//        receive_msg(received, _size(MSG_REQUEST), REQUEST, &handle_request);
-//        receive_msg(received, _size(MSG_CHAT_MESSAGE), MESSAGE, &handle_message);
+        receive_msg(received, _size(MSG_REQUEST), REQUEST, &handle_request);
+        receive_msg(received, _size(MSG_CHAT_MESSAGE), MESSAGE, &handle_message);
         receive_msg(received, _size(MSG_ROOM), ROOM, &handle_room_action);
-//        receive_msg(received, _size(MSG_SERVER2SERVER), SERVER2SERVER, &handle_server_heartbeat);
+        receive_msg(received, _size(MSG_SERVER2SERVER), SERVER2SERVER, &handle_server_heartbeat);
+        
+        if (time(0) - send_hb_time > 2) {
+            send_hb_time = time(0);
+            send_heartbeats_to_clients();
+        }
+        if (time(0) - check_hb_time > 2) {
+            check_hb_time = time(0);
+            check_heartbeat_table();
+        }
+        
         usleep(100);
     }
     free(received);
@@ -69,12 +83,117 @@ void handle_logout(void* received, int msg_type){
             break;
     }
 }
-void handle_request(void* received, int msg_type){
 
+void handle_request(void* received, int msg_type){
+    MSG_REQUEST temp = *(MSG_REQUEST*)(received);
+    if (temp.request_type == PONG) {
+        if ( time(0) - get_user_hbtime(temp.user_name) > 1){
+            kick_user(temp.user_name, get_user_id(temp.user_name));
+        }
+    } else {
+        MSG_USERS_LIST *list = get_list(temp.request_type);
+        msgsnd(get_user_id(temp.user_name), list, _size(MSG_USERS_LIST), 0);
+        free(list);
+    }
 }
 void handle_message(void* received, int msg_type){
+    MSG_CHAT_MESSAGE msg = *(MSG_CHAT_MESSAGE*)(received);
+    
+    MSG_RESPONSE rsp;
+    rsp.type = RESPONSE;
+    
+    if (msg.msg_type == PUBLIC) {
+        
+        if (is_local_user(msg.sender)) {
+            // if sender send msg to its parent server
 
+            int servers_to_removed[REPO_SIZE];
+            int servers_to_send[REPO_SIZE];
+            
+            int i;
+            
+            for (i=0; i<REPO_SIZE; ++i) {
+                servers_to_send[i] = 0;
+                servers_to_removed[i] = 0;
+            }
+        
+            lock_repo();
+                int j,k;
+                int all_servers_exists = TRUE;
+                for (i=0, j=0, k=0; i<REPO_SIZE; ++i) {
+                    if ( !strcmp(SHM_ROOM_SERVER_ADRESS[i].room_name, msg.receiver) &&
+                    SHM_ROOM_SERVER_ADRESS[i].server_id != MSG_RECEIVER &&
+                    SHM_ROOM_SERVER_ADRESS[i].server_id != -1   ) {
+                        if (!await_server_response(SHM_ROOM_SERVER_ADRESS[i].server_id)) {
+                            all_servers_exists = FALSE;
+                            servers_to_removed[j] = SHM_ROOM_SERVER_ADRESS[i].server_id;
+                            ++j;
+                        } else {
+                            servers_to_send[k] = SHM_ROOM_SERVER_ADRESS[i].server_id;
+                            ++k;
+                        }
+                    }
+                }
+            unlock_repo();
+            
+            if (all_servers_exists) {
+                for (i=0; i<REPO_SIZE; ++i) {
+                    if (servers_to_send[i]) {
+                        msgsnd(servers_to_send[i], &msg, _size(MSG_CHAT_MESSAGE), 0);
+                    }
+                }
+            } else {
+                for (i=0; i<REPO_SIZE; ++i) {
+                    if(servers_to_removed[i]) {
+                        remove_server(servers_to_removed[i]);
+                    }
+                }
+                rsp.response_type = MSG_NOT_SEND;
+                strcpy(rsp.content, "NOT EVERY SERVER RESPONDED");
+            }
+            
+            
+            for (i=0; i<MAX_USERS_NUMBER; ++i) {
+                if( !strcmp(LOCAL_REPO[i].room_name, msg.receiver) ) {
+                    msgsnd(LOCAL_REPO[i].client_id, &msg, _size(MSG_CHAT_MESSAGE), 0);
+                }
+            }
+        } else {
+            // if we are the second server and we send msg to users
+            
+            int i;
+            for (i=0; i<MAX_USERS_NUMBER; ++i) {
+                if( !strcmp(LOCAL_REPO[i].room_name, msg.receiver) ) {
+                    msgsnd(LOCAL_REPO[i].client_id, &msg, _size(MSG_CHAT_MESSAGE), 0);
+                }
+            }
+            
+            
+        }
+        
+    } else if (msg.msg_type == PRIVATE) {
+        
+        int node_server_id = check_if_user_exists(msg.receiver);
+        
+        if(node_server_id == MSG_RECEIVER) {
+            msgsnd(get_user_id(msg.receiver), &msg, _size(MSG_CHAT_MESSAGE), 0);
+        } else if (node_server_id != FALSE) {
+            if (await_server_response(node_server_id)) {
+            
+                msgsnd(node_server_id, &msg, _size(MSG_CHAT_MESSAGE), 0);
+            } else {
+                rsp.response_type = MSG_NOT_SEND;
+                strcpy(rsp.content, "SERVER DID NOT RESPOND");
+                remove_server(node_server_id);
+            }
+        } else if (node_server_id == FALSE) {
+            rsp.response_type = MSG_NOT_SEND;
+            strcpy(rsp.content, "USER DOESNT EXIST!");
+        }
+    }
+    msgsnd(get_user_id(msg.sender), &rsp, _size(MSG_RESPONSE), 0);
 }
+
 void handle_room_action(void* received, int msg_type){
     MSG_ROOM temp = *(MSG_ROOM*)(received);
     MSG_RESPONSE response;
@@ -113,7 +232,51 @@ void handle_room_action(void* received, int msg_type){
     msgsnd(client_id, &response, _size(MSG_RESPONSE), 0);
 }
 void handle_server_heartbeat(void* received, int msg_type){
+    MSG_SERVER2SERVER ping = *(MSG_SERVER2SERVER*)(received);
+    int receiver = ping.server_ipc_num;
+    ping.server_ipc_num = MSG_RECEIVER;
+    msgsnd(receiver, &ping, _size(MSG_SERVER2SERVER), 0);
+}
 
+int await_server_response(int node_server_id){
+    MSG_SERVER2SERVER pong;
+    MSG_SERVER2SERVER ping;
+    ping.type = SERVER2SERVER;
+    ping.server_ipc_num = MSG_RECEIVER;
+    msgsnd(node_server_id, &ping, _size(MSG_SERVER2SERVER), 0);
+    clock_t start = clock();
+    while (1) {
+        if (msgrcv(MSG_RECEIVER, &pong, _size(MSG_SERVER2SERVER), SERVER2SERVER, IPC_NOWAIT) != -1) {
+            return TRUE; 
+        } else if ( ((double)(clock()-start)*1000)/CLOCKS_PER_SEC > 500){
+            return FALSE;
+        }
+    }
+}
+
+MSG_USERS_LIST* get_list(int req_type){
+    MSG_USERS_LIST* result = (MSG_USERS_LIST*)malloc(sizeof(MSG_USERS_LIST));
+lock_repo();
+    int i,j;
+    if ( req_type == USERS_LIST) {
+        for (i=0, j=0; i<REPO_SIZE; ++i) {
+            if (SHM_USER_SERVER_ADRESS[i].server_id != -1) {
+                strcpy(result->users[j], SHM_USER_SERVER_ADRESS[i].user_name);
+                ++j;
+            }
+        }
+        result->type = USERS_LIST_TYPE;
+    } else if ( req_type == ROOMS_LIST) {
+        for (i=0, j=0; i<REPO_SIZE; ++i) {
+            if (SHM_ROOM_SERVER_ADRESS[i].server_id != -1) {
+                strcpy(result->users[j], SHM_ROOM_SERVER_ADRESS[i].room_name);
+                ++j;
+            }
+        }
+        result->type = ROOMS_LIST_TYPE;
+    }
+unlock_repo();
+    return result;
 }
 
 int get_user_id(const char* username){
@@ -125,6 +288,17 @@ int get_user_id(const char* username){
     }
     return -1;
 }
+
+time_t get_user_hbtime(const char* username){
+    int i;
+    for (i=0; i<MAX_USERS_NUMBER; ++i) {
+        if ( !strcmp(LOCAL_REPO[i].user_name, username) ) {
+            return LOCAL_REPO[i].hb_send_time;
+        }
+    }
+    return time(0);
+}
+
 
 int create_room(const char* roomname){
 lock_repo();
@@ -208,13 +382,62 @@ unlock_repo();
     
     return SUCCESS;
 }
+void kick_user(const char* username, int client_id){
+    MSG_LOGIN user;
+    user.type = LOGOUT;
+    user.ipc_num = client_id;
+    strcpy(user.username, username);
+    unregister_user(user);
+    remove_user_from_local_repo(client_id);
+}
+
+
+void check_heartbeat_table(){
+    int i;
+    for (i=0; i<MAX_USERS_NUMBER; ++i) {
+        if ( (LOCAL_REPO[i].client_id != -1) && ((time(0) - LOCAL_REPO[i].hb_send_time) > 3) ) {
+            kick_user(LOCAL_REPO[i].user_name, LOCAL_REPO[i].client_id);
+        }
+    }
+}
+
+
+void send_heartbeats_to_clients(){
+    int i;
+    MSG_RESPONSE hb;
+    hb.type = RESPONSE;
+    hb.response_type = PING;
+    strcpy(hb.content, "");
+    
+    for (i=0; i<MAX_USERS_NUMBER; ++i) {
+        if (LOCAL_REPO[i].client_id != -1) {
+            LOCAL_REPO[i].hb_send_time = time(0);
+            msgsnd(LOCAL_REPO[i].client_id, &hb, _size(MSG_RESPONSE), 0);
+        }
+    }
+}
+
+int check_if_user_exists(const char* username){
+    
+lock_repo();
+    int return_flag = FALSE;
+    int i;
+    for (i=0; i<REPO_SIZE; ++i) {
+        if (!strcmp(SHM_USER_SERVER_ADRESS[i].user_name, username)) {
+            return_flag = SHM_USER_SERVER_ADRESS[i].server_id;
+            break;
+        }
+    }
+unlock_repo();
+    return return_flag;
+}
 
 int unregister_user(MSG_LOGIN user){
 lock_repo();
     int return_flag = FAIL;
     int i;
     for(i=0; i<REPO_SIZE; ++i){
-        if( SHM_USER_SERVER_ADRESS[i].server_id == user.ipc_num){
+        if( !strcmp(SHM_USER_SERVER_ADRESS[i].user_name,user.username) ){
             SHM_USER_SERVER_ADRESS[i].server_id = -1;
             strcpy(SHM_USER_SERVER_ADRESS[i].user_name, "");
             return_flag =  SUCCESS;
@@ -233,7 +456,7 @@ lock_repo();
     for(i=0; i<REPO_SIZE; ++i){
         if( SHM_USER_SERVER_ADRESS[i].server_id == -1){
             strcpy(SHM_USER_SERVER_ADRESS[i].user_name, user.username);
-            SHM_USER_SERVER_ADRESS[i].server_id = user.ipc_num;
+            SHM_USER_SERVER_ADRESS[i].server_id = MSG_RECEIVER;
             log_data("USER FROM %d JOINED AS %s", user.ipc_num, user.username);
             return_flag = SUCCESS;
             break;
@@ -247,6 +470,40 @@ unlock_repo();
     if(return_flag == FULL)
         log_data("USER FROM %d WAS REJECT WHEN TRYING TO JOIN AS %s, SERVER FULL",user.ipc_num, user.username);
     return return_flag;
+}
+
+void remove_server(int server_id){
+lock_repo();
+    int i;
+    for (i=0; i<REPO_SIZE; ++i) {
+        if (SHM_USER_SERVER_ADRESS[i].server_id == server_id) {
+            SHM_USER_SERVER_ADRESS[i].server_id = -1;
+            strcpy(SHM_USER_SERVER_ADRESS[i].user_name, "");
+        }
+    }
+    for (i=0; i<REPO_SIZE; ++i) {
+        if (SHM_ROOM_SERVER_ADRESS[i].server_id == server_id) {
+            SHM_ROOM_SERVER_ADRESS[i].server_id = -1;
+            strcpy(SHM_ROOM_SERVER_ADRESS[i].room_name, "");
+        }
+    }
+    for (i=0; i<REPO_SIZE; ++i) {
+        if (SHM_SERVER_IDS_ADRESS[i] == server_id) {
+            SHM_SERVER_IDS_ADRESS[i] = -1;
+        }
+    }
+unlock_repo();
+    log_data("SERVER %d DID NOT RESPOND, REMOVING IT FROM REPO", server_id);
+}
+
+int is_local_user(const char* username){
+    int i;
+    for (i=0; i<MAX_USERS_NUMBER; ++i) {
+        if ( !strcmp(LOCAL_REPO[i].user_name, username) ) {
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 char* change_users_room_in_local_repo(int client_id, const char* roomname){
@@ -268,6 +525,7 @@ void init_local_repo(){
         LOCAL_REPO[i].client_id = -1;
         strcpy(LOCAL_REPO[i].room_name, "");
         strcpy(LOCAL_REPO[i].user_name, "");
+        LOCAL_REPO[i].hb_send_time = time(0);
     }
 }
 
@@ -278,6 +536,7 @@ void add_to_local_repo(int client_id, const char* username, const char* roomname
             LOCAL_REPO[i].client_id = client_id;
             strcpy(LOCAL_REPO[i].user_name, username);
             strcpy(LOCAL_REPO[i].room_name, roomname);
+            LOCAL_REPO[i].hb_send_time = time(0);
             return;
         }
     }
@@ -293,6 +552,7 @@ void remove_user_from_local_repo(int client_id){
             LOCAL_REPO[i].client_id = -1;
             strcpy(LOCAL_REPO[i].user_name, "");
             strcpy(LOCAL_REPO[i].room_name, "");
+            LOCAL_REPO[i].hb_send_time = time(0);
             return;
         }
     }

@@ -15,6 +15,7 @@ typedef struct {
     char user_name[USER_NAME_MAX_LENGTH];
     char room_name[ROOM_NAME_MAX_LENGTH];
     int client_id;
+    time_t hb_send_time;
 } client;
 
 typedef void (*fnc_handler)(void*, int);
@@ -71,14 +72,28 @@ void handle_server_heartbeat(void* received, int msg_type);
 
 int register_new_user(MSG_LOGIN user);
 int unregister_user(MSG_LOGIN user);
+int check_if_user_exists(const char* username);
+void remove_server(int server_id);
 
 void init_local_repo();
 void add_to_local_repo(int client_id, const char* username, const char* roomname);
 void remove_user_from_local_repo(int client_id);
 char* change_users_room_in_local_repo(int client_id, const char* roomname);
 
+int is_local_user(const char* username);
+
 int create_room(const char* roomname);
 int delete_room(const char* roomname);
 
 int get_user_id(const char* username);
+time_t get_user_hbtime(const char* username);
+
+MSG_USERS_LIST* get_list(int req_type);
+
+int await_server_response(int node_server_id);
+void send_heartbeats_to_clients();
+void check_heartbeat_table();
+
+void kick_user(const char* username, int client_id);
+
 #endif
