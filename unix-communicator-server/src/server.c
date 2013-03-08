@@ -9,16 +9,18 @@
 #include "protocol.h"
 #include "server.h"
 
+
+
 int main(int argc, const char * argv[])
 {
     init_server();
     void* received = malloc(2048);
     while(1){
         receive_msg(received, _size(MSG_LOGIN), LOGIN, &handle_login);
-//        receive_msg(received, _size(MSG_LOGIN), LOGOUT, &handle_logout);
+        receive_msg(received, _size(MSG_LOGIN), LOGOUT, &handle_logout);
 //        receive_msg(received, _size(MSG_REQUEST), REQUEST, &handle_request);
 //        receive_msg(received, _size(MSG_CHAT_MESSAGE), MESSAGE, &handle_message);
-//        receive_msg(received, _size(MSG_ROOM), ROOM, &handle_room_action);
+        receive_msg(received, _size(MSG_ROOM), ROOM, &handle_room_action);
 //        receive_msg(received, _size(MSG_SERVER2SERVER), SERVER2SERVER, &handle_server_heartbeat);
         usleep(100);
     }
@@ -32,9 +34,9 @@ void handle_login(void* received, int msg_type){
     response.type = RESPONSE;
     switch (register_new_user(temp) ) {
         case SUCCESS:
-            add_to_local_repo(temp.ipc_num, temp.username, "default");
+            add_to_local_repo(temp.ipc_num, temp.username, "");
             response.response_type = LOGIN_SUCCESS;
-            strcpy(response.content, "LOGIN SUCCESS - 200");
+            strcpy(response.content, "LOGIN SUCCESS - Connected to \'<no>\' channel");
             msgsnd(temp.ipc_num, &response, _size(MSG_RESPONSE), 0);
             break;
         case EXISTS:
@@ -74,10 +76,137 @@ void handle_message(void* received, int msg_type){
 
 }
 void handle_room_action(void* received, int msg_type){
-
+    MSG_ROOM temp = *(MSG_ROOM*)(received);
+    MSG_RESPONSE response;
+    response.type = RESPONSE;
+    int client_id = get_user_id(temp.user_name);
+    switch (temp.operation_type) {
+        case ENTER_ROOM:
+            if ( change_room(temp, client_id) == FULL ) {
+                response.response_type = ENTERED_ROOM_FAILED;
+                strcpy(response.content, "No space for new channel\n");
+            } else {
+                response.response_type = ENTERED_ROOM_SUCCESS;
+                strcpy(response.content, "Channel successfuly entered!\n");
+            }
+            break;
+        case LEAVE_ROOM:
+            strcpy(temp.room_name, "");
+            if ( change_room(temp, client_id) == FULL ) {
+                response.response_type = LEAVE_ROOM_FAILED;
+                strcpy(response.content, "No space for new channel\n");
+            } else {
+                response.response_type = LEAVE_ROOM_SUCCESS;
+                strcpy(response.content, "Channel successfuly left!\n");
+            }
+            break;
+        case CHANGE_ROOM:
+            if ( change_room(temp, client_id) == FULL ) {
+                response.response_type = CHANGE_ROOM_FAILED;
+                strcpy(response.content, "No space for new channel\n");
+            } else {
+                response.response_type = CHANGE_ROOM_SUCCESS;
+                strcpy(response.content, "Channel successfuly changed!\n");
+            }
+            break;
+    }
+    msgsnd(client_id, &response, _size(MSG_RESPONSE), 0);
 }
 void handle_server_heartbeat(void* received, int msg_type){
 
+}
+
+int get_user_id(const char* username){
+    int i;
+    for (i=0; i<MAX_USERS_NUMBER; ++i) {
+        if ( !strcmp(LOCAL_REPO[i].user_name, username) ) {
+            return LOCAL_REPO[i].client_id;
+        }
+    }
+    return -1;
+}
+
+int create_room(const char* roomname){
+lock_repo();
+    int return_flag = FULL;
+    int i;
+    for (i=0; i<REPO_SIZE; ++i) {
+        if (SHM_ROOM_SERVER_ADRESS[i].server_id == -1) {
+            SHM_ROOM_SERVER_ADRESS[i].server_id = MSG_RECEIVER;
+            strcpy(SHM_ROOM_SERVER_ADRESS[i].room_name, roomname);
+            return_flag = SUCCESS;
+            log_data("ROOM %s CREATED", roomname);
+            break;
+        }
+    }
+unlock_repo();
+    if (return_flag == FULL) {
+        log_data("ROOM %s COULDNT BE CREATED, NO SPACE", roomname);
+    }
+    return return_flag;
+}
+
+int delete_room(const char* roomname){
+lock_repo();
+    int return_flag = FAIL;
+    int i;
+    for (i=0; i<REPO_SIZE; ++i) {
+        if (SHM_ROOM_SERVER_ADRESS[i].server_id == MSG_RECEIVER && !strcmp(SHM_ROOM_SERVER_ADRESS[i].room_name, roomname)) {
+            SHM_ROOM_SERVER_ADRESS[i].server_id = -1;
+            strcpy(SHM_ROOM_SERVER_ADRESS[i].room_name, "");
+            log_data("ROOM %s DELETED", roomname);
+            return_flag = SUCCESS;
+            break;
+        }
+    }
+unlock_repo();
+    if (return_flag == FAIL) {
+        log_data("ROOM %s COULDNT BE DELETED, NOT FOUND", roomname);
+    }
+    return return_flag;
+}
+
+int count_people_in_room(const char* roomname){
+    int i;
+    int result =0;
+    for(i=0; i<MAX_USERS_NUMBER; ++i){
+        if (!strcmp(LOCAL_REPO[i].room_name, roomname)) {
+            result++;
+        }
+    }
+    return result;
+}
+
+int change_room(MSG_ROOM room_action, int client_id){
+    
+lock_repo();
+    int i;
+    int room_exists_on_server = FALSE;
+    for(i=0; i<REPO_SIZE; ++i){
+        if( !strcmp(SHM_ROOM_SERVER_ADRESS[i].room_name, room_action.room_name) &&
+           SHM_ROOM_SERVER_ADRESS[i].server_id == MSG_RECEIVER){
+            room_exists_on_server = TRUE;
+            break;
+        }
+    }
+unlock_repo();
+    
+    if (!room_exists_on_server) {
+        int return_flag = create_room(room_action.room_name);
+        if (return_flag == FULL) {
+            return FULL;
+        }
+    }
+    
+    char* old_room = change_users_room_in_local_repo(client_id, room_action.room_name);
+    if( count_people_in_room(old_room) == 0){
+        delete_room(old_room);
+    }
+    
+    log_data("USER %s CHANGED ROOM FROM  %s TO %s", room_action.user_name, old_room, room_action.room_name);
+    free(old_room);
+    
+    return SUCCESS;
 }
 
 int unregister_user(MSG_LOGIN user){
@@ -89,6 +218,7 @@ lock_repo();
             SHM_USER_SERVER_ADRESS[i].server_id = -1;
             strcpy(SHM_USER_SERVER_ADRESS[i].user_name, "");
             return_flag =  SUCCESS;
+            log_data("USER %s SIGNED OUT", user.username);
             break;
         }
     }
@@ -119,11 +249,24 @@ unlock_repo();
     return return_flag;
 }
 
+char* change_users_room_in_local_repo(int client_id, const char* roomname){
+    int i;
+    for(i=0; i<MAX_USERS_NUMBER; ++i){
+        if(LOCAL_REPO[i].client_id == client_id){
+            char* retval = (char*)malloc(ROOM_NAME_MAX_LENGTH*sizeof(char));
+            strcpy(retval, LOCAL_REPO[i].room_name);
+            strcpy(LOCAL_REPO[i].room_name, roomname);
+            return retval;
+        }
+    }
+    return NULL;
+}
+
 void init_local_repo(){
     int i;
     for(i=0; i<MAX_USERS_NUMBER; ++i){
         LOCAL_REPO[i].client_id = -1;
-        strcpy(LOCAL_REPO[i].room_name, "default");
+        strcpy(LOCAL_REPO[i].room_name, "");
         strcpy(LOCAL_REPO[i].user_name, "");
     }
 }
@@ -149,7 +292,7 @@ void remove_user_from_local_repo(int client_id){
         if (LOCAL_REPO[i].client_id == client_id) {
             LOCAL_REPO[i].client_id = -1;
             strcpy(LOCAL_REPO[i].user_name, "");
-            strcpy(LOCAL_REPO[i].room_name, "default");
+            strcpy(LOCAL_REPO[i].room_name, "");
             return;
         }
     }
@@ -173,7 +316,7 @@ void init_server(){
     
 
     register_new_server(MSG_RECEIVER);
-
+    create_room("");
     
     printf("SERVER READY, LISTENING ON QUEUE %d\n", MSG_RECEIVER);
 }
@@ -320,8 +463,16 @@ lock_repo();
             flag = TRUE;
         }
     }
-unlock_repo();
-    
+    unlock_repo();
+    for(i=0; i<MAX_USERS_NUMBER; ++i) {
+        if (LOCAL_REPO[i].client_id != -1){
+            MSG_LOGIN user;
+            user.ipc_num = LOCAL_REPO[i].client_id;
+            strcpy(user.username, LOCAL_REPO[i].user_name);
+            unregister_user(user);
+        }
+    }
+
     log_data("DEAD");
     
     //we are last server so we clean whole repo

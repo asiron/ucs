@@ -75,4 +75,10 @@ int unregister_user(MSG_LOGIN user);
 void init_local_repo();
 void add_to_local_repo(int client_id, const char* username, const char* roomname);
 void remove_user_from_local_repo(int client_id);
+char* change_users_room_in_local_repo(int client_id, const char* roomname);
+
+int create_room(const char* roomname);
+int delete_room(const char* roomname);
+
+int get_user_id(const char* username);
 #endif
